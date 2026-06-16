@@ -13,6 +13,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <cmath>
 
 using namespace std;
 using namespace chrono;
@@ -20,29 +21,29 @@ using namespace chrono;
 // =========================================================
 // 1. Data Structures & Circuit Definitions
 // =========================================================
-struct Gate { 
-    int id; string name; string type; vector<int> fanins; vector<string> inputs_raw; 
+struct Gate {
+    int id; string name; string type; vector<int> fanins; vector<string> inputs_raw;
 };
 
 struct Circuit {
-    unordered_map<string, int> name2id; 
-    vector<Gate> gates; 
-    vector<int> topo_order; 
-    vector<int> topo_idx; 
-    vector<int> pis; 
-    vector<int> pos; 
-    vector<string> orig_po_names; 
+    unordered_map<string, int> name2id;
+    vector<Gate> gates;
+    vector<int> topo_order;
+    vector<int> topo_idx;
+    vector<int> pis;
+    vector<int> pos;
+    vector<string> orig_po_names;
     vector<string> inputs_raw;
     int num_wires = 0;
     
     int get_id(const string& name) {
-        if (name2id.find(name) == name2id.end()) { 
-            name2id[name] = num_wires++; gates.push_back({name2id[name], name, "UNKNOWN", {}, {}}); 
+        if (name2id.find(name) == name2id.end()) {
+            name2id[name] = num_wires++; gates.push_back({name2id[name], name, "UNKNOWN", {}, {}});
         }
         return name2id[name];
     }
-    int find_id(const string& name) const { 
-        auto it = name2id.find(name); return (it != name2id.end()) ? it->second : -1; 
+    int find_id(const string& name) const {
+        auto it = name2id.find(name); return (it != name2id.end()) ? it->second : -1;
     }
     void build_topo_order() {
         vector<int> in_deg(num_wires, 0); vector<vector<int>> adj(num_wires);
@@ -61,42 +62,31 @@ struct Circuit {
 
 struct FailInfo { int pattern_idx; string wire_name; };
 
-struct SimResult {
-    int slat_tfsf = 0, slat_tpsf = 0, slat_tfsp = 0;
-    int splat_tfsf = 0, splat_tpsf = 0, splat_tfsp = 0;
-    int po_tfsf = 0, po_tpsf = 0, po_tfsp = 0;
-    
-    vector<uint64_t> slat_pattern_mask;
-    vector<uint64_t> splat_pattern_mask;
-    vector<uint64_t> sim_po_fails;
-    vector<uint64_t> sig_bits; 
+struct FaultCandidate {
+    int wire_id; int sa_val; string name; string type_str;
+    bool is_gi = false; int target_gate_id = -1; int target_fanin_idx = -1; string loc_str = "GO";
+    int tfsf = 0, tpsf = 0, tfsp = 0; uint64_t sig_hash = 0; double init_iou = 0.0;
 };
 
-struct FaultCandidate { 
-    int wire_id; 
-    int sa_val; 
-    string name; 
-    string type_str; 
-    
-    bool is_gi = false;
-    int target_gate_id = -1;
-    int target_fanin_idx = -1;
-    string loc_str = "GO"; 
-    
-    SimResult res; 
-    bool picked = false;
-    double set_cover_score = 0.0;
-    double unified_score = 0.0;
-    double display_score = 0.0;
+struct FaultGroup {
+    FaultCandidate rep;
+    vector<FaultCandidate> equivs;
+};
+
+// 【新增】：光束搜尋的狀態節點
+struct BeamState {
+    vector<int> combo;
+    int tfsf = 0, tpsf = 0, tfsp = 0;
+    double iou = 0.0;
 };
 
 // =========================================================
 // 2. Robust Parsers
 // =========================================================
-void trim(string& s) { 
+void trim(string& s) {
     if(s.empty()) return;
-    s.erase(0, s.find_first_not_of(" \t\r\n")); 
-    if(!s.empty()) s.erase(s.find_last_not_of(" \t\r\n") + 1); 
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    if(!s.empty()) s.erase(s.find_last_not_of(" \t\r\n") + 1);
 }
 string normalize_wire(const string &token) {
     string out = token;
@@ -109,19 +99,18 @@ void parse_ckt(const string& path, Circuit& ckt) {
     while (getline(file, line)) {
         trim(line); if (line.empty() || line[0] == '*' || line[0] == '#') continue;
         istringstream iss(line); vector<string> tokens; string t;
-        while (iss >> t) { 
-            string clean_t; for (char ch : t) if (ch != '"') clean_t += ch; 
-            if (clean_t != ";" && !clean_t.empty()) tokens.push_back(clean_t); 
+        while (iss >> t) {
+            string clean_t; for (char ch : t) if (ch != '"') clean_t += ch;
+            if (clean_t != ";" && !clean_t.empty()) tokens.push_back(clean_t);
         }
         if (tokens.empty()) continue;
-
-        if (tokens[0] == "i" || tokens[0] == "I") { 
+        if (tokens[0] == "i" || tokens[0] == "I") {
             if(tokens.size() >= 2) {
                 int id = ckt.get_id(tokens[1]); ckt.gates[id].type = "PI"; ckt.pis.push_back(id); ckt.inputs_raw.push_back(tokens[1]);
             }
         }
-        else if (tokens[0] == "o" || tokens[0] == "O") { 
-            if(tokens.size() >= 2) po_names.push_back(tokens[1]); 
+        else if (tokens[0] == "o" || tokens[0] == "O") {
+            if(tokens.size() >= 2) po_names.push_back(tokens[1]);
         }
         else if (tokens[0] == "name" || tokens[0] == "c" || tokens[0] == "C") continue;
         else {
@@ -129,12 +118,12 @@ void parse_ckt(const string& path, Circuit& ckt) {
                 int type_idx = -1;
                 for (size_t i = 0; i < tokens.size(); ++i) {
                     string upper_t = tokens[i]; for(char& c: upper_t) c = toupper(c);
-                    if (upper_t == "AND" || upper_t == "NAND" || upper_t == "OR" || upper_t == "NOR" || 
+                    if (upper_t == "AND" || upper_t == "NAND" || upper_t == "OR" || upper_t == "NOR" ||
                         upper_t == "XOR" || upper_t == "XNOR" || upper_t == "NOT" || upper_t == "BUF") { type_idx = i; break; }
                 }
                 if (type_idx != -1 && type_idx < (int)tokens.size() - 1) {
                     string type = tokens[type_idx]; for (char &c : type) c = toupper(c);
-                    string out_wire = tokens.back(); tokens.pop_back(); 
+                    string out_wire = tokens.back(); tokens.pop_back();
                     int out_id = ckt.get_id(out_wire); ckt.gates[out_id].type = type;
                     vector<int> temp_fanins; vector<string> temp_inputs_raw;
                     for (size_t i = type_idx + 1; i < tokens.size(); ++i) {
@@ -148,13 +137,13 @@ void parse_ckt(const string& path, Circuit& ckt) {
             }
         }
     }
-    for (const string& name : po_names) { 
-        int real_id = ckt.find_id(name); 
-        if (real_id != -1) { 
+    for (const string& name : po_names) {
+        int real_id = ckt.find_id(name);
+        if (real_id != -1) {
             int dummy_id = ckt.get_id(name + "_PO"); ckt.gates[dummy_id].type = "PO"; ckt.gates[dummy_id].fanins.push_back(real_id);
             string safe_po_name = name; safe_po_name.erase(remove(safe_po_name.begin(), safe_po_name.end(), '*'), safe_po_name.end());
             ckt.orig_po_names.push_back(safe_po_name);
-        } 
+        }
     }
     for (int i = 0; i < ckt.num_wires; ++i) {
         if (ckt.gates[i].type == "UNKNOWN" && !ckt.gates[i].name.empty() && ckt.gates[i].name.back() == '*') {
@@ -169,16 +158,16 @@ void parse_ckt(const string& path, Circuit& ckt) {
 void parse_patterns(const string& path, vector<string>& patterns, int num_pis) {
     ifstream file(path); string line;
     while (getline(file, line)) {
-        trim(line); 
+        trim(line);
         if (line.empty() || line[0] == '#' || line[0] == '*') continue;
         size_t start = line.find("T'");
-        if (start != string::npos) { 
-            size_t end = line.find("'", start + 2); 
+        if (start != string::npos) {
+            size_t end = line.find("'", start + 2);
             if (end != string::npos) {
                 string pat = line.substr(start + 2, end - start - 2);
-                if ((int)pat.length() < num_pis) pat.append(num_pis - pat.length(), '0'); 
-                else if ((int)pat.length() > num_pis) pat = pat.substr(0, num_pis); 
-                patterns.push_back(pat); 
+                if ((int)pat.length() < num_pis) pat.append(num_pis - pat.length(), '0');
+                else if ((int)pat.length() > num_pis) pat = pat.substr(0, num_pis);
+                patterns.push_back(pat);
             }
         }
     }
@@ -187,25 +176,21 @@ void parse_patterns(const string& path, vector<string>& patterns, int num_pis) {
 void parse_faillog(const string& path, vector<FailInfo>& fails, const vector<string>& patterns) {
     ifstream file(path); string line;
     while (getline(file, line)) {
-        trim(line); 
+        trim(line);
         size_t vec_start = line.find("vector["); if (vec_start == string::npos) continue;
         size_t vec_end = line.find("]", vec_start); if (vec_end == string::npos) continue;
-        
         int p_idx = -1;
         try { if(vec_end > vec_start + 7) p_idx = stoi(line.substr(vec_start + 7, vec_end - vec_start - 7)); } catch (...) { continue; }
-        
         size_t wire_start = line.find_first_not_of(" \t", vec_end + 1); if(wire_start == string::npos) continue;
         size_t wire_end = line.find_first_of(" \t\r\n,", wire_start); string wire_name;
         if (wire_end == string::npos) wire_name = line.substr(wire_start);
         else wire_name = line.substr(wire_start, wire_end - wire_start);
-        
         wire_name.erase(remove(wire_name.begin(), wire_name.end(), '"'), wire_name.end());
         wire_name.erase(remove(wire_name.begin(), wire_name.end(), '*'), wire_name.end());
-        
-        size_t exp_pos = line.find("expect"); size_t obs_pos = line.find("observe"); 
+        size_t exp_pos = line.find("expect"); size_t obs_pos = line.find("observe");
         if (exp_pos != string::npos && obs_pos != string::npos) {
-            if (exp_pos + 7 < line.length() && obs_pos + 8 < line.length()) { 
-                if (line[exp_pos + 7] == line[obs_pos + 8]) continue; 
+            if (exp_pos + 7 < line.length() && obs_pos + 8 < line.length()) {
+                if (line[exp_pos + 7] == line[obs_pos + 8]) continue;
             }
         }
         if (p_idx >= 0 && p_idx < (int)patterns.size()) fails.push_back({p_idx, wire_name});
@@ -213,107 +198,39 @@ void parse_faillog(const string& path, vector<FailInfo>& fails, const vector<str
 }
 
 // =========================================================
-// 3. Sequential Simulator (For genFailLog)
-// =========================================================
-struct MultiFault { int gate_index = -1; int input_pos = -1; int pi_index = -1; int sa = 0; string loc; };
-static int eval_gate(const string &type, const vector<int> &inputs) {
-    if (inputs.empty()) return 0;
-    string t = type; for(char& c: t) c = tolower(c);
-    if (t == "and") { int val = 1; for (int v : inputs) val &= v; return val; }
-    if (t == "or") { int val = 0; for (int v : inputs) val |= v; return val; }
-    if (t == "nand") { int val = 1; for (int v : inputs) val &= v; return val ? 0 : 1; }
-    if (t == "nor") { int val = 0; for (int v : inputs) val |= v; return val ? 0 : 1; }
-    if (t == "xor") { int val = 0; for (int v : inputs) val ^= v; return val; }
-    if (t == "xnor") { int val = 0; for (int v : inputs) val ^= v; return val ? 0 : 1; }
-    if (t == "not") return inputs[0] ? 0 : 1;
-    if (t == "buf" || t == "po") return inputs[0];
-    return 0;
-}
-
-static vector<int> simulate_outputs_multi(const Circuit &ckt, const string &pattern, const vector<MultiFault> &faults) {
-    vector<int> values(ckt.num_wires, 0);
-    for (size_t i = 0; i < ckt.pis.size() && i < pattern.size(); ++i) {
-        int val = (pattern[i] == '1') ? 1 : 0;
-        for (const MultiFault &f : faults) if (f.gate_index == -1 && f.loc == "GO" && f.pi_index == static_cast<int>(i)) val = f.sa;
-        values[ckt.pis[i]] = val;
-    }
-    for (int gidx : ckt.topo_order) {
-        const Gate &gate = ckt.gates[gidx];
-        if (gate.type == "PI") continue;
-        vector<int> inputs; inputs.reserve(gate.fanins.size());
-        for (size_t i = 0; i < gate.fanins.size(); ++i) {
-            int val = values[gate.fanins[i]];
-            for (const MultiFault &f : faults) if (f.gate_index == gidx && f.loc == "GI" && f.input_pos == static_cast<int>(i)) val = f.sa;
-            inputs.push_back(val);
-        }
-        int out_val = eval_gate(gate.type, inputs);
-        for (const MultiFault &f : faults) if (f.gate_index == gidx && f.loc == "GO") out_val = f.sa;
-        values[gidx] = out_val;
-    }
-    vector<int> outputs; outputs.reserve(ckt.pos.size());
-    for (int idx : ckt.pos) outputs.push_back(values[idx]); 
-    return outputs;
-}
-
-static void run_gen_fail_log(const string &pattern_path, const string &ckt_path, const vector<string> &fault_args) {
-    Circuit ckt; parse_ckt(ckt_path, ckt);
-    vector<string> patterns; parse_patterns(pattern_path, patterns, ckt.pis.size());
-    unordered_map<string, int> gate_index;
-    for (size_t i = 0; i < ckt.gates.size(); ++i) gate_index[ckt.gates[i].name] = static_cast<int>(i);
-
-    vector<MultiFault> faults;
-    for (size_t i = 0; i + 3 < fault_args.size(); i += 4) {
-        string wire_raw = fault_args[i], gate_name = fault_args[i + 1], loc = fault_args[i + 2];
-        int sa = (fault_args[i + 3] == "SA1") ? 1 : 0;
-        string wire_base = normalize_wire(wire_raw);
-        MultiFault f; f.loc = loc; f.sa = sa;
-        if (gate_name.rfind("dummy_gate", 0) == 0) {
-            int pi = -1;
-            for (size_t p = 0; p < ckt.inputs_raw.size(); ++p) if (normalize_wire(ckt.inputs_raw[p]) == wire_base) { pi = p; break; }
-            if (pi >= 0) { f.pi_index = pi; faults.push_back(f); }
-            continue;
-        }
-        auto it = gate_index.find(gate_name);
-        if (it == gate_index.end()) continue;
-        f.gate_index = it->second;
-
-        if (loc == "GI") {
-            const Gate &gate = ckt.gates[f.gate_index]; int pos = -1;
-            for (size_t k = 0; k < gate.inputs_raw.size(); ++k) if (normalize_wire(gate.inputs_raw[k]) == wire_base) { pos = k; break; }
-            if (pos >= 0) { f.input_pos = pos; faults.push_back(f); }
-        } else faults.push_back(f);
-    }
-    vector<vector<int>> golden_outputs(patterns.size());
-    for (size_t p = 0; p < patterns.size(); ++p) golden_outputs[p] = simulate_outputs_multi(ckt, patterns[p], {});
-    for (size_t p = 0; p < patterns.size(); ++p) {
-        vector<int> faulty_outputs = simulate_outputs_multi(ckt, patterns[p], faults);
-        for (size_t o = 0; o < ckt.orig_po_names.size(); ++o) {
-            if (faulty_outputs[o] != golden_outputs[p][o]) {
-                char exp = golden_outputs[p][o] ? 'H' : 'L'; char obs = faulty_outputs[o] ? 'H' : 'L';
-                cout << "vector[" << p << "] " << ckt.orig_po_names[o] << " expect " << exp << ", observe " << obs << "  # T'" << patterns[p] << "'\n";
-            }
-        }
-    }
-}
-
-// =========================================================
-// 4. Parallel Simulator (Supporting GI & GO Faults)
+// 3. Hyper-Optimized Parallel Simulator (Dirty List Support)
 // =========================================================
 class Simulator {
 public:
-    int num_patterns, num_wires, chunks; vector<uint64_t> good_vals, fault_vals, mask_all_ones;
+    int num_patterns, num_wires, chunks; 
+    vector<uint64_t> good_vals, fault_vals, mask_all_ones;
+    
+    // 【核心改良】：Dirty List 原生陣列，徹底消除 Cache Miss
+    vector<bool> has_go_fault;
+    vector<uint64_t> go_mask;
+    vector<int> gi_override_fanin;
+    vector<uint64_t> gi_override_val;
+
     Simulator(int np, int nw) : num_patterns(np), num_wires(nw) {
         chunks = (np + 63) / 64; if (chunks == 0) chunks = 1;
-        good_vals.resize(nw * chunks, 0); fault_vals.resize(nw * chunks, 0); mask_all_ones.resize(chunks, ~0ULL); if (np % 64 != 0) mask_all_ones.back() = (1ULL << (np % 64)) - 1;
+        good_vals.resize(nw * chunks, 0); fault_vals.resize(nw * chunks, 0); 
+        mask_all_ones.resize(chunks, ~0ULL); if (np % 64 != 0) mask_all_ones.back() = (1ULL << (np % 64)) - 1;
+        
+        has_go_fault.resize(nw, false);
+        go_mask.resize(nw, 0);
+        gi_override_fanin.resize(nw, -1);
+        gi_override_val.resize(nw, 0);
     }
+
     void load_patterns(const vector<string>& patterns, const Circuit& ckt) {
-        for (int p = 0; p < num_patterns; ++p) { 
-            int c = p / 64, b = p % 64; 
-            for (int pi_idx = 0; pi_idx < (int)ckt.pis.size(); ++pi_idx) { 
-                if (pi_idx < (int)patterns[p].size() && patterns[p][pi_idx] == '1') good_vals[ckt.pis[pi_idx] * chunks + c] |= (1ULL << b); 
-            } 
+        for (int p = 0; p < num_patterns; ++p) {
+            int c = p / 64, b = p % 64;
+            for (int pi_idx = 0; pi_idx < (int)ckt.pis.size(); ++pi_idx) {
+                if (pi_idx < (int)patterns[p].size() && patterns[p][pi_idx] == '1') good_vals[ckt.pis[pi_idx] * chunks + c] |= (1ULL << b);
+            }
         }
     }
+
     void simulate_good(const Circuit& ckt) {
         for (int gid : ckt.topo_order) {
             const auto& g = ckt.gates[gid]; if (g.type == "PI" || g.fanins.empty()) continue;
@@ -332,265 +249,282 @@ public:
         }
     }
     
-    SimResult simulate_hybrid_score(const Circuit& ckt, const FaultCandidate& cand, const vector<uint64_t>& obs_fail_matrix, const vector<uint64_t>& obs_any_fail) {
+    // 【新增】：真正的多重錯誤聯合模擬器 (N-Tuple Co-simulation)
+    void simulate_multi(const Circuit& ckt, const vector<int>& combo_indices, const vector<FaultGroup>& groups, const vector<uint64_t>& obs_fail_matrix, int& out_tfsf, int& out_tpsf, int& out_tfsp, double& out_iou, uint64_t* out_sig = nullptr) {
         fault_vals = good_vals; 
-        int start_idx;
-
-        if (!cand.is_gi) { 
-            for (int c = 0; c < chunks; ++c) fault_vals[cand.wire_id * chunks + c] = (cand.sa_val == 0) ? 0 : mask_all_ones[c];
-            start_idx = max(0, ckt.topo_idx[cand.wire_id] + 1);
-        } else { 
-            start_idx = ckt.topo_idx[cand.target_gate_id]; 
+        
+        vector<int> dirty_wires;
+        vector<int> dirty_gates;
+        int start_idx = ckt.topo_order.size();
+        
+        for(int idx : combo_indices) {
+            const auto& f = groups[idx].rep;
+            if (!f.is_gi) {
+                has_go_fault[f.wire_id] = true;
+                go_mask[f.wire_id] = (f.sa_val == 1) ? ~0ULL : 0ULL;
+                dirty_wires.push_back(f.wire_id);
+                start_idx = min(start_idx, max(0, ckt.topo_idx[f.wire_id]));
+            } else {
+                gi_override_fanin[f.target_gate_id] = f.target_fanin_idx;
+                gi_override_val[f.target_gate_id] = (f.sa_val == 1) ? ~0ULL : 0ULL;
+                dirty_gates.push_back(f.target_gate_id);
+                start_idx = min(start_idx, max(0, ckt.topo_idx[f.target_gate_id]));
+            }
         }
 
         for (size_t i = start_idx; i < ckt.topo_order.size(); ++i) {
-            int gid = ckt.topo_order[i]; const auto& g = ckt.gates[gid]; if (g.type == "PI" || g.fanins.empty()) continue;
-            
-            if (cand.is_gi && gid == cand.target_gate_id) {
-                for (int c = 0; c < chunks; ++c) {
-                    uint64_t res = 0;
-                    auto get_in_val = [&](int fi_idx) {
-                        return (fi_idx == cand.target_fanin_idx) ? ((cand.sa_val == 0) ? 0 : mask_all_ones[c]) : fault_vals[g.fanins[fi_idx] * chunks + c];
-                    };
-                    if (g.type == "AND") { res = mask_all_ones[c]; for (size_t fi=0; fi<g.fanins.size(); ++fi) res &= get_in_val(fi); }
-                    else if (g.type == "NAND") { res = mask_all_ones[c]; for (size_t fi=0; fi<g.fanins.size(); ++fi) res &= get_in_val(fi); res = ~res & mask_all_ones[c]; }
-                    else if (g.type == "OR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) res |= get_in_val(fi); }
-                    else if (g.type == "NOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) res |= get_in_val(fi); res = ~res & mask_all_ones[c]; }
-                    else if (g.type == "XOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) res ^= get_in_val(fi); }
-                    else if (g.type == "XNOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) res ^= get_in_val(fi); res = ~res & mask_all_ones[c]; }
-                    else if (g.type == "NOT") { res = ~get_in_val(0) & mask_all_ones[c]; }
-                    else if (g.type == "BUF" || g.type == "PO") { res = get_in_val(0); }
-                    fault_vals[gid * chunks + c] = res;
-                }
-                continue; 
+            int gid = ckt.topo_order[i]; const auto& g = ckt.gates[gid];
+            if (has_go_fault[gid]) {
+                for(int c=0; c<chunks; ++c) fault_vals[gid*chunks+c] = go_mask[gid] & mask_all_ones[c];
+                continue;
             }
+            if (g.type == "PI") continue;
 
+            int ov_fanin = gi_override_fanin[gid];
             for (int c = 0; c < chunks; ++c) {
                 uint64_t res = 0;
-                if (g.type == "AND") { res = mask_all_ones[c]; for (int fi : g.fanins) res &= fault_vals[fi * chunks + c]; }
-                else if (g.type == "NAND") { res = mask_all_ones[c]; for (int fi : g.fanins) res &= fault_vals[fi * chunks + c]; res = ~res & mask_all_ones[c]; }
-                else if (g.type == "OR") { res = 0; for (int fi : g.fanins) res |= fault_vals[fi * chunks + c]; }
-                else if (g.type == "NOR") { res = 0; for (int fi : g.fanins) res |= fault_vals[fi * chunks + c]; res = ~res & mask_all_ones[c]; }
-                else if (g.type == "XOR") { res = 0; for (int fi : g.fanins) res ^= fault_vals[fi * chunks + c]; }
-                else if (g.type == "XNOR") { res = 0; for (int fi : g.fanins) res ^= fault_vals[fi * chunks + c]; res = ~res & mask_all_ones[c]; }
-                else if (g.type == "NOT") { res = ~fault_vals[g.fanins[0] * chunks + c] & mask_all_ones[c]; }
-                else if (g.type == "BUF" || g.type == "PO") { res = fault_vals[g.fanins[0] * chunks + c]; }
-                fault_vals[g.id * chunks + c] = res;
+                if (g.type == "AND") { res = mask_all_ones[c]; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res &= v; } }
+                else if (g.type == "NAND") { res = mask_all_ones[c]; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res &= v; } res = ~res & mask_all_ones[c]; }
+                else if (g.type == "OR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res |= v; } }
+                else if (g.type == "NOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res |= v; } res = ~res & mask_all_ones[c]; }
+                else if (g.type == "XOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res ^= v; } }
+                else if (g.type == "XNOR") { res = 0; for (size_t fi=0; fi<g.fanins.size(); ++fi) { uint64_t v = ((int)fi == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[fi] * chunks + c]; res ^= v; } res = ~res & mask_all_ones[c]; }
+                else if (g.type == "NOT") { uint64_t v = (0 == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[0] * chunks + c]; res = ~v & mask_all_ones[c]; }
+                else if (g.type == "BUF" || g.type == "PO") { uint64_t v = (0 == ov_fanin) ? gi_override_val[gid] : fault_vals[g.fanins[0] * chunks + c]; res = v; }
+                fault_vals[gid * chunks + c] = res;
             }
         }
-
-        SimResult res; res.sig_bits.reserve(ckt.pos.size() * chunks); res.sim_po_fails.assign(ckt.pos.size() * chunks, 0);
+        
+        out_tfsf = 0; out_tpsf = 0; out_tfsp = 0;
+        uint64_t hash_val = 0;
         for (int c = 0; c < chunks; ++c) {
-            uint64_t exact_match = mask_all_ones[c], subset_match = mask_all_ones[c], sim_any_fail = 0;
-            uint64_t po_tfsf_c = 0, po_tpsf_c = 0, po_tfsp_c = 0;
-
             for (size_t i = 0; i < ckt.pos.size(); ++i) {
                 int po_id = ckt.pos[i];
                 uint64_t sim_po_fail = (good_vals[po_id * chunks + c] ^ fault_vals[po_id * chunks + c]) & mask_all_ones[c];
                 uint64_t obs_po_fail = obs_fail_matrix[i * chunks + c];
-
-                res.sim_po_fails[i * chunks + c] = sim_po_fail;
-                exact_match &= ~(sim_po_fail ^ obs_po_fail);
-                subset_match &= ~(sim_po_fail & ~obs_po_fail); 
-                sim_any_fail |= sim_po_fail;
-                res.sig_bits.push_back(sim_po_fail);
-
-                po_tfsf_c += __builtin_popcountll(sim_po_fail & obs_po_fail);
-                po_tpsf_c += __builtin_popcountll(sim_po_fail & ~obs_po_fail);
-                po_tfsp_c += __builtin_popcountll(~sim_po_fail & obs_po_fail);
+                out_tfsf += __builtin_popcountll(sim_po_fail & obs_po_fail);
+                out_tpsf += __builtin_popcountll(sim_po_fail & ~obs_po_fail);
+                out_tfsp += __builtin_popcountll(~sim_po_fail & obs_po_fail);
+                if (out_sig) hash_val ^= sim_po_fail + 0x9e3779b9 + (hash_val << 6) + (hash_val >> 2);
             }
-            exact_match &= mask_all_ones[c]; subset_match &= mask_all_ones[c];
-
-            uint64_t slat_mask = exact_match & obs_any_fail[c] & sim_any_fail;
-            uint64_t splat_mask = subset_match & obs_any_fail[c] & sim_any_fail;
-
-            res.slat_pattern_mask.push_back(slat_mask);
-            res.splat_pattern_mask.push_back(splat_mask);
-
-            res.slat_tfsf += __builtin_popcountll(slat_mask);
-            res.slat_tpsf += __builtin_popcountll(sim_any_fail & ~slat_mask & mask_all_ones[c]);
-            res.slat_tfsp += __builtin_popcountll(obs_any_fail[c] & ~slat_mask & mask_all_ones[c]);
-
-            res.splat_tfsf += __builtin_popcountll(splat_mask);
-            res.splat_tpsf += __builtin_popcountll(sim_any_fail & ~splat_mask & mask_all_ones[c]);
-            res.splat_tfsp += __builtin_popcountll(obs_any_fail[c] & ~splat_mask & mask_all_ones[c]);
-
-            res.po_tfsf += po_tfsf_c;
-            res.po_tpsf += po_tpsf_c;
-            res.po_tfsp += po_tfsp_c;
         }
-        return res;
+        out_iou = (double)out_tfsf / (out_tfsf + out_tpsf + out_tfsp + 1e-9);
+        if (out_sig) *out_sig = hash_val;
+
+        // Dirty List 極速還原 (維持高效能)
+        for(int w : dirty_wires) has_go_fault[w] = false;
+        for(int g : dirty_gates) gi_override_fanin[g] = -1;
     }
 };
 
 // =========================================================
-// 5. Ultimate Multi-Fault Engine (Zero-Pruning + Exact Set Cover)
+// 4. True Global Exact Match Beam Search (GEM-BS)
 // =========================================================
 void run_diag(const string& ptn_path, const string& ckt_path, const string& log_path) {
     auto start_time = high_resolution_clock::now();
-
     Circuit ckt; parse_ckt(ckt_path, ckt);
     vector<string> patterns; parse_patterns(ptn_path, patterns, ckt.pis.size());
     vector<FailInfo> fails; parse_faillog(log_path, fails, patterns);
     if (patterns.empty() || ckt.num_wires == 0) return;
-
+    
     Simulator sim(patterns.size(), ckt.num_wires);
     sim.load_patterns(patterns, ckt); sim.simulate_good(ckt);
-
+    
     unordered_map<string, int> po_name2idx;
     for (size_t i = 0; i < ckt.orig_po_names.size(); ++i) po_name2idx[ckt.orig_po_names[i]] = i;
-
+    
     vector<uint64_t> obs_fail_matrix(ckt.orig_po_names.size() * sim.chunks, 0);
-    vector<uint64_t> obs_any_fail(sim.chunks, 0);
+    vector<bool> po_ever_failed(ckt.pos.size(), false);
     for (auto& f : fails) {
         if (po_name2idx.count(f.wire_name)) {
             int po_idx = po_name2idx[f.wire_name];
             int c = f.pattern_idx / 64, b = f.pattern_idx % 64;
             obs_fail_matrix[po_idx * sim.chunks + c] |= (1ULL << b);
-            obs_any_fail[c] |= (1ULL << b);
+            po_ever_failed[po_idx] = true;
         }
     }
-
-    vector<FaultCandidate> candidates;
     
-    // 【無損注入】：生成所有 GO 錯誤
+    vector<bool> in_fail_cone(ckt.num_wires, false);
+    queue<int> q;
+    for (size_t i = 0; i < ckt.pos.size(); ++i) {
+        if (po_ever_failed[i]) { in_fail_cone[ckt.pos[i]] = true; q.push(ckt.pos[i]); }
+    }
+    vector<vector<int>> rev_adj(ckt.num_wires);
+    for (int i = 0; i < ckt.num_wires; ++i) { for (int fi : ckt.gates[i].fanins) rev_adj[i].push_back(fi); }
+    while(!q.empty()) {
+        int u = q.front(); q.pop();
+        for (int fi : rev_adj[u]) { if (!in_fail_cone[fi]) { in_fail_cone[fi] = true; q.push(fi); } }
+    }
+    
+    vector<FaultCandidate> raw_candidates;
     for (int w = 0; w < ckt.num_wires; ++w) {
-        if (ckt.gates[w].type == "PO") continue; 
+        if (ckt.gates[w].type == "PO") continue;
+        if (!in_fail_cone[w]) continue;
         for (int sa_val = 0; sa_val <= 1; ++sa_val) {
             FaultCandidate cand; cand.wire_id = w; cand.sa_val = sa_val; cand.name = ckt.gates[w].name; cand.type_str = (sa_val == 0 ? "SA0" : "SA1");
             cand.is_gi = false; cand.loc_str = "GO";
-            cand.res = sim.simulate_hybrid_score(ckt, cand, obs_fail_matrix, obs_any_fail);
-            if (cand.res.po_tfsf > 0) candidates.push_back(cand);
+            raw_candidates.push_back(cand);
         }
     }
-    // 【無損注入】：生成所有 GI 錯誤
     for (int gid = 0; gid < ckt.num_wires; ++gid) {
         const auto& g = ckt.gates[gid];
-        if (g.type == "PO" || g.type == "PI") continue; 
+        if (g.fanins.size() <= 1 || g.type == "PO" || g.type == "PI") continue;
+        if (!in_fail_cone[gid]) continue;
         for (size_t fi_idx = 0; fi_idx < g.fanins.size(); ++fi_idx) {
             int in_wire = g.fanins[fi_idx];
             for (int sa_val = 0; sa_val <= 1; ++sa_val) {
                 FaultCandidate cand; cand.wire_id = in_wire; cand.sa_val = sa_val; cand.name = ckt.gates[in_wire].name; cand.type_str = (sa_val == 0 ? "SA0" : "SA1");
                 cand.is_gi = true; cand.target_gate_id = gid; cand.target_fanin_idx = fi_idx; cand.loc_str = g.name + " GI";
-                cand.res = sim.simulate_hybrid_score(ckt, cand, obs_fail_matrix, obs_any_fail);
-                if (cand.res.po_tfsf > 0) candidates.push_back(cand);
+                raw_candidates.push_back(cand);
             }
         }
     }
-
-    // 【TF-IDF 權重計算】
-    int total_po_bits = ckt.pos.size() * sim.chunks * 64;
-    vector<int> tf_count(total_po_bits, 0);
-    vector<double> tfidf(total_po_bits, 0.0);
-
-    for (const auto& cand : candidates) {
-        for (int c = 0; c < sim.chunks; ++c) {
-            uint64_t splat = cand.res.splat_pattern_mask[c]; 
-            if (!splat) continue;
-            for (size_t po = 0; po < ckt.pos.size(); ++po) {
-                uint64_t cov = cand.res.sim_po_fails[po * sim.chunks + c] & splat & obs_fail_matrix[po * sim.chunks + c];
-                int base_idx = (po * sim.chunks + c) * 64;
-                for(int b = 0; b < 64; ++b) if ((cov >> b) & 1) tf_count[base_idx + b]++;
-            }
+    
+    vector<FaultGroup> groups;
+    unordered_map<uint64_t, int> sig2group;
+    vector<FaultGroup> dummy_groups; 
+    for(auto& c : raw_candidates) dummy_groups.push_back({c, {}});
+    
+    for (size_t i = 0; i < raw_candidates.size(); ++i) {
+        auto& cand = raw_candidates[i];
+        sim.simulate_multi(ckt, {(int)i}, dummy_groups, obs_fail_matrix, cand.tfsf, cand.tpsf, cand.tfsp, cand.init_iou, &cand.sig_hash);
+        if (cand.tfsf == 0) continue; 
+        auto it = sig2group.find(cand.sig_hash);
+        if (it != sig2group.end()) {
+            groups[it->second].equivs.push_back(cand);
+        } else {
+            sig2group[cand.sig_hash] = groups.size();
+            groups.push_back({cand, {}});
         }
     }
-    for (int i = 0; i < total_po_bits; ++i) if (tf_count[i] > 0) tfidf[i] = 1.0 / (double)tf_count[i];
-
-    // 【純粹貪婪集合覆蓋】: 絕不容許 TPSF 誤判干擾
-    vector<uint64_t> unexplained = obs_fail_matrix;
-    int rank_counter = 1;
-    while (true) {
-        int best_idx = -1; double max_cover_score = 0.0;
-
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            if (candidates[i].picked) continue;
-            double score = 0.0;
-            for (int c = 0; c < sim.chunks; ++c) {
-                uint64_t splat = candidates[i].res.splat_pattern_mask[c];
-                if (!splat) continue; 
-                for (size_t po = 0; po < ckt.pos.size(); ++po) {
-                    uint64_t cov = unexplained[po * sim.chunks + c] & candidates[i].res.sim_po_fails[po * sim.chunks + c] & splat;
-                    int base_idx = (po * sim.chunks + c) * 64;
-                    for (int b = 0; b < 64; ++b) if ((cov >> b) & 1) score += tfidf[base_idx + b];
-                }
-            }
-            if (score > 0) {
-                // 微弱懲罰，防止同分時選到大雜訊
-                score -= candidates[i].res.po_tpsf * 0.00001; 
-                score += candidates[i].res.slat_tfsf * 0.0000001; 
-                if (score > max_cover_score) { max_cover_score = score; best_idx = i; }
-            }
-        }
-
-        if (best_idx != -1 && max_cover_score > 0) {
-            double assigned = 100000.0 - rank_counter * 1000.0;
-            candidates[best_idx].set_cover_score = assigned;
-            candidates[best_idx].picked = true;
-            rank_counter++;
-            
-            for (int c = 0; c < sim.chunks; ++c) {
-                uint64_t splat = candidates[best_idx].res.splat_pattern_mask[c];
-                for (size_t po = 0; po < ckt.pos.size(); ++po) unexplained[po * sim.chunks + c] &= ~(candidates[best_idx].res.sim_po_fails[po * sim.chunks + c] & splat);
-            }
-            // 讓行為 100% 相同的等效錯誤共享榮耀
-            for (size_t i = 0; i < candidates.size(); ++i) {
-                if (!candidates[i].picked && candidates[i].res.sig_bits == candidates[best_idx].res.sig_bits) {
-                    candidates[i].picked = true; candidates[i].set_cover_score = assigned;
-                }
-            }
-        } else break;
-    }
-
-    for (auto& cand : candidates) {
-        cand.unified_score = cand.set_cover_score + cand.res.slat_tfsf * 10.0 + cand.res.splat_tfsf * 1.0 - cand.res.po_tpsf * 0.01;
-        if (cand.set_cover_score > 0) cand.display_score = 100.0;
-        else if (cand.res.slat_tfsf > 0) cand.display_score = (double)cand.res.slat_tfsf / (cand.res.slat_tfsf + cand.res.slat_tpsf) * 100.0;
-        else if (cand.res.splat_tfsf > 0) cand.display_score = (double)cand.res.splat_tfsf / (cand.res.splat_tfsf + cand.res.splat_tpsf) * 100.0;
-        else cand.display_score = (double)cand.res.po_tfsf / (cand.res.po_tfsf + cand.res.po_tpsf) * 100.0;
-    }
-
-    sort(candidates.begin(), candidates.end(), [](const FaultCandidate& a, const FaultCandidate& b) {
-        if (abs(a.unified_score - b.unified_score) > 1e-6) return a.unified_score > b.unified_score;
-        return a.wire_id < b.wire_id; 
+    sort(groups.begin(), groups.end(), [](const FaultGroup& a, const FaultGroup& b) {
+        return a.rep.init_iou > b.rep.init_iou;
     });
+    
+    // 【高 Accuracy 核心配置】利用 5 倍 Runtime 的預算，擴大光束搜尋寬度！
+    int POOL_SIZE = min(200, (int)groups.size()); 
+    int BEAM_WIDTH = 100;
+    int MAX_DEPTH = 7; 
+    
+    vector<BeamState> beam;
+    BeamState best_overall; best_overall.iou = -1.0;
+    for (int i = 0; i < POOL_SIZE; ++i) {
+        BeamState s; s.combo.push_back(i);
+        s.tfsf = groups[i].rep.tfsf; s.tpsf = groups[i].rep.tpsf; s.tfsp = groups[i].rep.tfsp;
+        s.iou = groups[i].rep.init_iou;
+        beam.push_back(s);
+        if (s.iou > best_overall.iou) best_overall = s;
+    }
+    
+    // 💡真正的 Beam Search 聯合作戰推演
+    for (int depth = 2; depth <= MAX_DEPTH; ++depth) {
+        vector<BeamState> next_beam;
+        for (const auto& state : beam) {
+            if (state.tpsf == 0 && state.tfsp == 0) { 
+                next_beam.push_back(state); continue;
+            }
+            for (int i = 0; i < POOL_SIZE; ++i) {
+                if (i <= state.combo.back()) continue; 
+                bool conflict = false;
+                for (int idx : state.combo) {
+                    if (groups[idx].rep.wire_id == groups[i].rep.wire_id) { conflict = true; break; }
+                }
+                if (conflict) continue;
+                
+                BeamState ns = state;
+                ns.combo.push_back(i);
+                sim.simulate_multi(ckt, ns.combo, groups, obs_fail_matrix, ns.tfsf, ns.tpsf, ns.tfsp, ns.iou);
+                
+                // Occam's Razor Penalty 降低過擬合
+                ns.iou -= (depth * 0.00005); 
+                next_beam.push_back(ns);
+                
+                bool is_better = false;
+                if (ns.iou > best_overall.iou + 1e-5) {
+                    is_better = true;
+                } else if (abs(ns.iou - best_overall.iou) <= 1e-5 && ns.combo.size() < best_overall.combo.size()) {
+                    is_better = true; 
+                }
+                if (is_better) best_overall = ns;
+            }
+        }
+        sort(next_beam.begin(), next_beam.end(), [](const BeamState& a, const BeamState& b) {
+            if (abs(a.iou - b.iou) > 1e-5) return a.iou > b.iou;
+            return a.combo.size() < b.combo.size(); 
+        });
+        if ((int)next_beam.size() > BEAM_WIDTH) next_beam.resize(BEAM_WIDTH);
+        beam = next_beam;
+        if (best_overall.tpsf == 0 && best_overall.tfsp == 0) break; 
+    }
 
+    // 【新增】：Post-Search Redundancy Elimination (去除冗餘錯誤，保住 Resolution)
+    vector<int> minimal_combo;
+    for (size_t i = 0; i < best_overall.combo.size(); ++i) {
+        vector<int> test_combo;
+        for (size_t j = 0; j < best_overall.combo.size(); ++j) {
+            if (i != j) test_combo.push_back(best_overall.combo[j]);
+        }
+        int t_tfsf = 0, t_tpsf = 0, t_tfsp = 0; double t_iou = 0.0;
+        if (!test_combo.empty()) sim.simulate_multi(ckt, test_combo, groups, obs_fail_matrix, t_tfsf, t_tpsf, t_tfsp, t_iou);
+        
+        bool is_redundant = false;
+        if (abs(t_iou - best_overall.iou) < 1e-5) is_redundant = true;
+        if (t_tpsf == 0 && t_tfsp == 0 && best_overall.tpsf == 0 && best_overall.tfsp == 0) is_redundant = true;
+        
+        if (!is_redundant) minimal_combo.push_back(best_overall.combo[i]);
+    }
+    best_overall.combo = minimal_combo;
+    if (!best_overall.combo.empty()) {
+        sim.simulate_multi(ckt, best_overall.combo, groups, obs_fail_matrix, best_overall.tfsf, best_overall.tpsf, best_overall.tfsp, best_overall.iou);
+    }
+
+    // 格式化輸出
     cout << "#Circuit Summary:\n#---------------\n";
     cout << "#number of inputs = " << ckt.pis.size() << "\n#number of outputs = " << ckt.pos.size() << "\n";
     cout << "#number of gates = " << (ckt.num_wires - ckt.pis.size() - ckt.pos.size()) << "\n#number of wires = " << ckt.num_wires << "\n";
     cout << "#number of vectors = " << patterns.size() << "\n#number of failing outputs = " << fails.size() << "\n";
     cout << "Ranked suspect faults\n";
-
-    int rank = 1, output_count = 0;
-    for (size_t i = 0; i < candidates.size() && output_count < 10; ++i) { // 輸出 10 名
-        if (candidates[i].display_score == 0.0) continue; 
-        
-        bool is_duplicate = false;
-        for (int j = 0; j < i; ++j) { if (candidates[j].res.sig_bits == candidates[i].res.sig_bits) { is_duplicate = true; break; } }
-        if (is_duplicate) continue;
-
-        vector<string> eq_faults;
-        for (size_t j = i + 1; j < candidates.size(); ++j) {
-            // 完整印出所有等效錯誤 (TA腳本字串比對所需)
-            if (candidates[j].res.sig_bits == candidates[i].res.sig_bits) eq_faults.push_back(candidates[j].name + " " + candidates[j].loc_str + " " + candidates[j].type_str);
+    
+    int rank = 1;
+    unordered_set<int> printed_group_idx;
+    auto print_group = [&](int idx, double assign_score, int d_tfsf, int d_tpsf, int d_tfsp) {
+        const auto& rep = groups[idx].rep;
+        const auto& equivs = groups[idx].equivs;
+        set<string> printed_names; 
+        printed_names.insert(rep.name);
+        vector<string> eq_strs;
+        for (const auto& eq : equivs) {
+            if (printed_names.find(eq.name) == printed_names.end()) {
+                printed_names.insert(eq.name);
+                eq_strs.push_back(eq.name + " " + eq.loc_str + " " + eq.type_str);
+            }
         }
-
-        int d_tfsf = candidates[i].res.slat_tfsf > 0 ? candidates[i].res.slat_tfsf : candidates[i].res.splat_tfsf;
-        int d_tpsf = candidates[i].res.slat_tfsf > 0 ? candidates[i].res.slat_tpsf : candidates[i].res.splat_tpsf;
-        int d_tfsp = candidates[i].res.slat_tfsf > 0 ? candidates[i].res.slat_tfsp : candidates[i].res.splat_tfsp;
-        if (d_tfsf == 0) { d_tfsf = candidates[i].res.po_tfsf; d_tpsf = candidates[i].res.po_tpsf; d_tfsp = candidates[i].res.po_tfsp; }
-
-        cout << "No. " << rank << " " << candidates[i].name << " " << candidates[i].loc_str << " " << candidates[i].type_str 
-             << ", TFSF=" << d_tfsf << ", TPSF=" << d_tpsf << ", TFSP=" << d_tfsp 
-             << ", score=" << fixed << setprecision(1) << candidates[i].display_score;
-             
-        if (!eq_faults.empty()) {
+        cout << "No. " << rank << " " << rep.name << " " << rep.loc_str << " " << rep.type_str
+             << ", TFSF=" << d_tfsf << ", TPSF=" << d_tpsf << ", TFSP=" << d_tfsp
+             << ", score=" << fixed << setprecision(1) << assign_score;
+        if (!eq_strs.empty()) {
             cout << " [equivalent faults: ";
-            for (size_t k = 0; k < eq_faults.size(); ++k) cout << eq_faults[k] << (k == eq_faults.size() - 1 ? "" : ", ");
+            for (size_t k = 0; k < eq_strs.size(); ++k) cout << eq_strs[k] << (k == eq_strs.size() - 1 ? "" : ", ");
             cout << "]";
         }
-        cout << "\n"; rank++; output_count++;
+        cout << "\n"; rank++;
+        printed_group_idx.insert(idx);
+    };
+    
+    // 第一梯隊：輸出 Beam Search 找到的最佳組合
+    for (int idx : best_overall.combo) {
+        if (rank > 10) break;
+        double pure_iou = (double)best_overall.tfsf / (best_overall.tfsf + best_overall.tpsf + best_overall.tfsp + 1e-9);
+        print_group(idx, pure_iou * 100.0, groups[idx].rep.tfsf, groups[idx].rep.tpsf, groups[idx].rep.tfsp);
     }
-
+    
+    // 第二梯隊：如果名額未滿，用初選的高分單兵填補
+    for (size_t i = 0; i < groups.size() && rank <= 10; ++i) {
+        if (printed_group_idx.count(i)) continue;
+        double pure_iou = (double)groups[i].rep.tfsf / (groups[i].rep.tfsf + groups[i].rep.tpsf + groups[i].rep.tfsp + 1e-9);
+        print_group(i, pure_iou * 100.0, groups[i].rep.tfsf, groups[i].rep.tpsf, groups[i].rep.tfsp);
+    }
+    
     auto end_time = high_resolution_clock::now(); duration<double> diff = end_time - start_time;
     cout << "# run time = " << fixed << setprecision(3) << diff.count() << "s\n";
 }
